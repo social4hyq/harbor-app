@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <g fill="none" stroke="#000" stroke-width="4" stroke-linecap="round" stroke-linejoin="round">
+    <!-- 锚环 -->
+    <circle cx="32" cy="13" r="5"/>
+    <!-- 锚杆 -->
+    <line x1="32" y1="18" x2="32" y2="46"/>
+    <!-- 锚横杆 -->
+    <line x1="22" y1="24" x2="42" y2="24"/>
+    <!-- 锚弯钩（底部两爪） -->
+    <path d="M14 36 C14 46, 22 52, 32 52 C42 52, 50 46, 50 36"/>
+    <!-- 左爪尖 -->
+    <path d="M14 36 L11 31 M14 36 L19 31"/>
+    <!-- 右爪尖 -->
+    <path d="M50 36 L45 31 M50 36 L55 31"/>
+  </g>
+</svg>

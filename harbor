@@ -1,0 +1,388 @@
+#!/usr/bin/env python3
+"""harbor — 鸿蒙版 brew services（基于 Harbor HAP 的回环 IPC）。
+
+子命令（对齐 brew services）：
+  list              列出所有服务状态（默认）
+  start <name>      启动服务
+  stop <name>       停止服务
+  restart <name>    重启服务
+  status <name>     单个服务状态
+  info <name>       服务详情（Command/Log/Env）
+  discover          扫描已装 brew formula 的 .service，提示可加入的服务
+  cleanup           提示清理已移除服务的残留 pidfile
+  set-autohide <t|f> 设置启动时是否自动隐藏到托盘（开机自启场景设 true）
+  set-timer <name> cron <OnCalendar> | interval <秒> | off   设置/取消定时任务
+  reload            让 HAP 重读配置
+  ping              测试 IPC 连通性
+
+配置：~/.config/harbor/apps.json
+IPC：127.0.0.1:19876（Harbor HAP 内 TCPSocketServer）
+"""
+import json
+import os
+import socket
+import sys
+import glob
+
+HOST = "127.0.0.1"
+PORT = 19876
+CONFIG = os.path.expanduser("~/.config/harbor/apps.json")
+BRIDGE_CONF = os.path.expanduser("~/.config/harbor/bridge.conf")
+CELLAR = os.path.expanduser("~/.harmonybrew/Cellar")
+
+
+def read_token() -> str:
+    """读 IPC token；不存在则生成（CLI 侧生成，避免 HAP 写宿主 .config 的权限问题）。"""
+    import secrets
+    try:
+        with open(BRIDGE_CONF, encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("token="):
+                    return line.split("=", 1)[1].strip()
+    except FileNotFoundError:
+        pass
+    # 生成 64 hex token
+    token = secrets.token_hex(32)
+    os.makedirs(os.path.dirname(BRIDGE_CONF), exist_ok=True)
+    with open(BRIDGE_CONF, "w", encoding="utf-8") as f:
+        f.write(f"addr=127.0.0.1:{PORT}\ntoken={token}\n")
+    try:
+        os.chmod(BRIDGE_CONF, 0o600)
+    except OSError:
+        pass
+    print(f"已生成 IPC token -> {BRIDGE_CONF}（HAP 下次命令自动读取）", file=sys.stderr)
+    return token
+
+
+def ipc(cmd: str, timeout: float = 10.0) -> str:
+    """向 Harbor 发一条带鉴权的文本行命令，返回响应（去掉换行）。"""
+    try:
+        s = socket.create_connection((HOST, PORT), timeout=timeout)
+    except OSError as e:
+        print(f"ERR 无法连接 Harbor ({HOST}:{PORT}): {e}", file=sys.stderr)
+        print("   HAP 是否已启动并缩到托盘？", file=sys.stderr)
+        sys.exit(2)
+    try:
+        s.sendall(("AUTH " + read_token() + " " + cmd + "\n").encode())
+        s.settimeout(timeout)
+        data = b""
+        while b"\n" not in data:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+    finally:
+        s.close()
+    return data.decode(errors="replace").strip()
+
+
+def read_config() -> dict:
+    try:
+        with open(CONFIG, encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        print(f"ERR 配置文件不存在: {CONFIG}", file=sys.stderr)
+        sys.exit(2)
+    except json.JSONDecodeError as e:
+        print(f"ERR 配置解析失败: {e}", file=sys.stderr)
+        sys.exit(2)
+
+
+def parse_ok(resp: str):
+    """解析 'OK <json>' / 'ERR <msg>'，失败则打印并退出。"""
+    if resp.startswith("OK"):
+        payload = resp[2:].strip()
+        if not payload:
+            return None
+        try:
+            return json.loads(payload)
+        except json.JSONDecodeError:
+            return payload
+    print(resp, file=sys.stderr)
+    sys.exit(1)
+
+
+def cmd_list(args):
+    resp = ipc("STATUS")
+    services = parse_ok(resp)
+    if not services:
+        print("无服务")
+        return
+    name_w = max(len(s["name"]) for s in services)
+    print(f"{'Name':<{name_w}}  {'Status':<12}  PID")
+    print(f"{'-' * name_w}  {'-' * 12}  ---")
+    for s in services:
+        status = s.get("status", "?")
+        pid = s.get("pid", 0)
+        color = {"started": "\033[32m", "error": "\033[31m"}.get(status, "")
+        reset = "\033[0m" if color else ""
+        print(f"{s['name']:<{name_w}}  {color}{status:<12}{reset}  {pid if pid else '-'}")
+
+
+def set_enabled(name: str, enabled: bool):
+    """持久化服务的 enabled 状态（对齐 systemctl enable/disable）。"""
+    cfg = read_config()
+    found = False
+    for a in cfg["apps"]:
+        if a["name"] == name:
+            a["enabled"] = enabled
+            found = True
+            break
+    if found:
+        write_config(cfg)
+    return found
+
+
+def cmd_simple(name: str, action: str):
+    if not name:
+        print(f"ERR {action} 需要服务名", file=sys.stderr)
+        sys.exit(2)
+    if action == "START":
+        set_enabled(name, True)
+    elif action == "STOP":
+        set_enabled(name, False)
+    resp = ipc(f"{action} {name}")
+    result = parse_ok(resp)
+    print(f"{name}: {result.get('result', 'ok') if isinstance(result, dict) else result}")
+
+
+def cmd_status(args):
+    services = parse_ok(ipc("STATUS"))
+    target = args[0] if args else None
+    for s in services or []:
+        if target is None or s["name"] == target:
+            print(f"{s['name']}: {s.get('status')} (pid {s.get('pid') or '-'})")
+
+
+def cmd_set_timer(args):
+    """给服务设置定时任务（systemd timer 语义）。
+
+    harbor set-timer <name> cron <OnCalendar>
+      例: set-timer mihomo cron '*-*-* 03:00:00'     每天 03:00 重启
+          set-timer mihomo cron 'Sun *-*-* 00:00:00' 每周日 00:00
+          set-timer mihomo cron '*-*-* *:30:00'      每小时第 30 分
+    harbor set-timer <name> interval <秒数>
+      例: set-timer mihomo interval 3600             每 3600 秒重启
+    harbor set-timer <name> off              取消定时
+    """
+    if len(args) < 2:
+        print(cmd_set_timer.__doc__, file=sys.stderr)
+        sys.exit(2)
+    name, kind = args[0], args[1].lower()
+    cfg = read_config()
+    app = next((a for a in cfg["apps"] if a["name"] == name), None)
+    if not app:
+        print(f"ERR 无此服务: {name}", file=sys.stderr)
+        sys.exit(1)
+    if kind == "off":
+        app.pop("timer", None)
+        print(f"{name}: 定时已取消")
+    elif kind == "cron" and len(args) >= 3:
+        app["timer"] = {"type": "calendar", "onCalendar": args[2]}
+        print(f"{name}: cron -> {args[2]}")
+    elif kind == "interval" and len(args) >= 3:
+        try:
+            sec = int(args[2])
+        except ValueError:
+            print("ERR interval 需秒数", file=sys.stderr)
+            sys.exit(2)
+        app["timer"] = {"type": "interval", "onUnitActiveSec": sec}
+        print(f"{name}: interval -> {sec}s")
+    else:
+        print(cmd_set_timer.__doc__, file=sys.stderr)
+        sys.exit(2)
+    write_config(cfg)
+    print("下次 HAP tick（10 秒内）自动生效，无需 reload")
+
+
+def cmd_set_autohide(args):
+    """设置启动时是否自动隐藏到托盘（开机自启场景设 true）。"""
+    if not args or args[0].lower() not in ("true", "false", "1", "0"):
+        print("用法: harbor set-autohide <true|false>", file=sys.stderr)
+        sys.exit(2)
+    val = args[0].lower() in ("true", "1")
+    cfg = read_config()
+    cfg["autoHideOnLaunch"] = val
+    write_config(cfg)
+    print(f"autoHideOnLaunch = {val}")
+    print("下次 HAP 启动时生效（开机自启场景建议设 true）")
+
+
+def cmd_cleanup(args):
+    """清理已移除服务的残留 pidfile（对齐 brew services cleanup）。
+
+    pidfile 在 HAP 沙箱内 CLI 看不到，通过 HAP 侧 STATUS 无法列出已移除服务。
+    这里只能提示用户在 HAP 内清理，或重启 HAP 时自动清理（v3）。
+    """
+    cfg = read_config()
+    names = {a["name"] for a in cfg["apps"]}
+    print("当前配置服务: " + ", ".join(sorted(names)))
+    print("提示：已从 apps.json 移除的服务，其 pidfile 位于 HAP 沙箱")
+    print("      /data/storage/el2/base/cache/harbor/<name>.pid，重启 HAP 时会自动忽略。")
+    print("      （HAP 侧自动清理将在 v3 实现；当前不影响功能。）")
+
+
+def parse_unit_brief(path: str) -> dict:
+    """从 .service 提取 ExecStart/Environment/Log 用于 info 展示。"""
+    out = {"exec": "", "env": [], "log": ""}
+    try:
+        with open(path, encoding="utf-8") as f:
+            in_service = False
+            for line in f:
+                line = line.strip()
+                if line.startswith("["):
+                    in_service = line == "[Service]"
+                    continue
+                if not in_service or not line or line.startswith(("#", ";")):
+                    continue
+                if "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k, v = k.strip(), v.strip()
+                if k == "ExecStart":
+                    out["exec"] = v
+                elif k == "Environment":
+                    out["env"].append(v)
+                elif k in ("StandardOutput", "StandardError") and v.startswith("append:"):
+                    out["log"] = v[len("append:"):]
+    except OSError:
+        pass
+    return out
+
+
+def cmd_info(args):
+    if not args:
+        print("ERR info 需要服务名", file=sys.stderr)
+        sys.exit(2)
+    name = args[0]
+    cfg = read_config()
+    app = next((a for a in cfg["apps"] if a["name"] == name), None)
+    if not app:
+        print(f"ERR 无此服务: {name}", file=sys.stderr)
+        sys.exit(1)
+    print(f"Name:    {app['name']}")
+    print(f"Type:    {app.get('type', 'exec')}")
+    print(f"Enabled: {app.get('enabled', True)}")
+    print(f"Pidfile: {app['pidfile']}")
+    timer = app.get("timer")
+    if timer:
+        if timer.get("type") == "calendar":
+            print(f"Timer:   OnCalendar {timer.get('onCalendar')}")
+        else:
+            print(f"Timer:   OnUnitActiveSec {timer.get('onUnitActiveSec')}s")
+    if app.get("type") == "unit" and app.get("unit"):
+        u = parse_unit_brief(app["unit"])
+        print(f"Unit:    {app['unit']}")
+        print(f"Command: {u['exec']}")
+        if u["log"]:
+            print(f"Log:     {u['log']}")
+        for e in u["env"]:
+            print(f"Env:     {e}")
+    else:
+        print(f"Command: {app.get('bin', '')} {' '.join(app.get('args', []))}")
+        if app.get("log"):
+            print(f"Log:     {app['log']}")
+        for k, v in (app.get("env") or {}).items():
+            print(f"Env:     {k}={v}")
+
+
+def opt_unit(name: str) -> str:
+    """brew formula 的稳定 unit 路径（opt/ 是 symlink，brew upgrade 后自动指向新版）。"""
+    return os.path.expanduser(f"~/.harmonybrew/opt/{name}/sh.brew.{name}.service")
+
+
+def discover_units() -> list:
+    """扫描已装 brew formula 的 .service（用 opt/ 稳定路径）。"""
+    units = []
+    for path in sorted(glob.glob(os.path.join(CELLAR, "*", "*", "sh.brew.*.service"))):
+        name = os.path.basename(path).replace("sh.brew.", "").replace(".service", "")
+        units.append((name, opt_unit(name)))
+    # 去重（同名多版本只留一个）
+    seen, out = set(), []
+    for name, u in units:
+        if name not in seen and os.path.exists(u):
+            seen.add(name)
+            out.append((name, u))
+    return out
+
+
+def write_config(cfg: dict):
+    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+    with open(CONFIG, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+
+
+def cmd_discover(args):
+    """扫描已装 brew formula 的 .service，对比 apps.json。
+
+    discover --add <formula> [name]  把某个 unit 加入 apps.json（用 opt/ 稳定路径）
+    """
+    cfg = read_config()
+    configured_names = {a["name"] for a in cfg["apps"]}
+
+    if args and args[0] == "--add":
+        if len(args) < 2:
+            print("ERR --add 需要 formula 名（如 zellij）", file=sys.stderr)
+            sys.exit(2)
+        formula = args[1]
+        svc_name = args[2] if len(args) >= 3 else formula
+        unit = opt_unit(formula)
+        if not os.path.exists(unit):
+            print(f"ERR 无此 brew service: {unit}", file=sys.stderr)
+            sys.exit(1)
+        if svc_name in configured_names:
+            print(f"ERR 服务名已存在: {svc_name}", file=sys.stderr)
+            sys.exit(1)
+        pidfile = f"/data/storage/el2/base/cache/harbor/{svc_name}.pid"
+        cfg["apps"].append({
+            "name": svc_name,
+            "type": "unit",
+            "unit": unit,
+            "pidfile": pidfile,
+        })
+        write_config(cfg)
+        print(f"已加入 {svc_name} -> {unit}")
+        print("运行 'harbor reload' 让 HAP 重读配置后即可 start")
+        return
+
+    units = discover_units()
+    print(f"发现 {len(units)} 个 brew service（稳定 opt/ 路径）：")
+    for name, u in units:
+        mark = "*" if name in configured_names else " "
+        print(f" [{mark}] {name:<16} {u}")
+    print("\n[*] 已在 apps.json。加入新服务：harbor discover --add <formula>")
+    print("pidfile 自动设为 /data/storage/el2/base/cache/harbor/<name>.pid")
+
+
+def main():
+    if len(sys.argv) < 2:
+        cmd_list([])
+        return
+    sub = sys.argv[1]
+    rest = sys.argv[2:]
+    handlers = {
+        "list": cmd_list,
+        "start": lambda a: cmd_simple(a[0] if a else "", "START"),
+        "stop": lambda a: cmd_simple(a[0] if a else "", "STOP"),
+        "restart": lambda a: cmd_simple(a[0] if a else "", "RESTART"),
+        "status": cmd_status,
+        "info": cmd_info,
+        "discover": cmd_discover,
+        "cleanup": cmd_cleanup,
+        "set-autohide": cmd_set_autohide,
+        "set-timer": cmd_set_timer,
+        "reload": lambda a: print(parse_ok(ipc("RELOAD"))),
+        "ping": lambda a: print(parse_ok(ipc("PING"))),
+        "-h": lambda a: print(__doc__),
+        "--help": lambda a: print(__doc__),
+    }
+    if sub not in handlers:
+        print(f"ERR 未知子命令: {sub}", file=sys.stderr)
+        print(__doc__, file=sys.stderr)
+        sys.exit(2)
+    handlers[sub](rest)
+
+
+if __name__ == "__main__":
+    main()
