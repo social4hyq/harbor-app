@@ -9,4 +9,6 @@
 /.clang-format
 /.clang-tidy
 **/.test
-/.appanalyzer
+/.appanalyzer/dist
+/logs
+/entry/src/main/cpp/libs
