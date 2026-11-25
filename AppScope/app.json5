@@ -1,7 +1,7 @@
 {
   "app": {
-    "bundleName": "org.social4hyq.harbor",
-    "vendor": "example",
+    "bundleName": "com.social4hyq.harbor",
+    "vendor": "social4hyq",
     "versionCode": 1000000,
     "versionName": "1.0.0",
     "icon": "$media:layered_image",

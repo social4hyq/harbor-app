@@ -12,7 +12,7 @@ On HarmonyOS PC, processes are reclaimed by **cgroup, not parentage**. `setsid n
 
 - Reads systemd `.service` units (`ExecStart`, `Environment`, `StandardOutput=append:`) or direct `exec` entries
 - Real tray: closing the window calls `hideAbility()` (window gone from taskbar, process alive); tray click restores it
-- Token-authenticated loopback IPC (`AUTH <token> <cmd>`), token in `~/.config/harbor/bridge.conf`
+- Token-authenticated loopback IPC (`AUTH <token> <cmd>`), token in `~/.config/harbor/ipc.conf`
 - `keep_alive` watchdog with retry backoff; cron (`OnCalendar`) and interval (`OnUnitActiveSec`) timers
 - Boot autostart via the system Settings → App startup manager, with `autoHideOnLaunch` to hide silently
 

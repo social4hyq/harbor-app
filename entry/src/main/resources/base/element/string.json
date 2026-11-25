@@ -6,15 +6,15 @@
     },
     {
       "name": "module_desc",
-      "value": "module description"
+      "value": "Harbor service manager module"
     },
     {
       "name": "EntryAbility_desc",
-      "value": "description"
+      "value": "Harbor service manager"
     },
     {
       "name": "EntryAbility_label",
-      "value": "label"
+      "value": "Harbor"
     }
   ]
 }

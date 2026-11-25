@@ -10,14 +10,14 @@ const DOMAIN = 0x0000;
 const TAG = 'HarborIpc';
 const PORT = 19876;
 const CONFIG_PATH = '/storage/Users/currentUser/.config/harbor/apps.json';
-const BRIDGE_CONF = '/storage/Users/currentUser/.config/harbor/bridge.conf';
+const IPC_CONF = '/storage/Users/currentUser/.config/harbor/ipc.conf';
 
-// 读取 IPC token（由 CLI 生成写入 bridge.conf；HAP 只读，避免写宿主 .config 权限问题）
+// 读取 IPC token（由 CLI 生成写入 ipc.conf；HAP 只读，避免写宿主 .config 权限问题）
 // 每次 handle 时重新读，CLI 生成 token 后下条命令即可通过
 function readToken(): string {
   try {
-    if (fileIo.accessSync(BRIDGE_CONF)) {
-      const text = fileIo.readTextSync(BRIDGE_CONF);
+    if (fileIo.accessSync(IPC_CONF)) {
+      const text = fileIo.readTextSync(IPC_CONF);
       for (const line of text.split('\n')) {
         if (line.startsWith('token=')) return line.substring(6).trim();
       }

@@ -9,7 +9,7 @@ CLT="${HARBOR_CLT:-/opt/electron-ohos-clt}"
 [ -d "$CLT" ] || CLT="$HOME/HarmonyPC/Myspace/build-test/electron-ohos-clt"
 SDK="${HARBOR_SDK:-$CLT/sdk}"
 HVIGOR="${HARBOR_HVIGOR:-$CLT/hvigor/bin/hvigorw}"
-SP="${HARBOR_SIGN_PROJECT:-$HOME/.app-installer/projects/org.social4hyq.harbor}"
+SP="${HARBOR_SIGN_PROJECT:-$HOME/.app-installer/projects/com.social4hyq.harbor}"
 
 export DEVECO_SDK_HOME="$SDK" HOS_SDK_HOME="$SDK" OHOS_BASE_SDK_HOME="$SDK"
 
@@ -39,7 +39,7 @@ zip -q -d "$HAP" 'libs/*' 2>/dev/null || true
 
 echo "==> [4/4] 签名安装"
 app-installer install --hap "$HAP" \
-  --bundle-id org.social4hyq.harbor --app-name Harbor \
+  --bundle-id com.social4hyq.harbor --app-name Harbor \
   --module entry --ability EntryAbility \
   --profile "$SP/build-profile.json5" \
   --signed-hap "$HERE/dist/harbor-signed.hap"

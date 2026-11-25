@@ -27,7 +27,7 @@ import glob
 HOST = "127.0.0.1"
 PORT = 19876
 CONFIG = os.path.expanduser("~/.config/harbor/apps.json")
-BRIDGE_CONF = os.path.expanduser("~/.config/harbor/bridge.conf")
+IPC_CONF = os.path.expanduser("~/.config/harbor/ipc.conf")
 CELLAR = os.path.expanduser("~/.harmonybrew/Cellar")
 
 
@@ -35,7 +35,7 @@ def read_token() -> str:
     """读 IPC token；不存在则生成（CLI 侧生成，避免 HAP 写宿主 .config 的权限问题）。"""
     import secrets
     try:
-        with open(BRIDGE_CONF, encoding="utf-8") as f:
+        with open(IPC_CONF, encoding="utf-8") as f:
             for line in f:
                 if line.startswith("token="):
                     return line.split("=", 1)[1].strip()
@@ -43,14 +43,14 @@ def read_token() -> str:
         pass
     # 生成 64 hex token
     token = secrets.token_hex(32)
-    os.makedirs(os.path.dirname(BRIDGE_CONF), exist_ok=True)
-    with open(BRIDGE_CONF, "w", encoding="utf-8") as f:
+    os.makedirs(os.path.dirname(IPC_CONF), exist_ok=True)
+    with open(IPC_CONF, "w", encoding="utf-8") as f:
         f.write(f"addr=127.0.0.1:{PORT}\ntoken={token}\n")
     try:
-        os.chmod(BRIDGE_CONF, 0o600)
+        os.chmod(IPC_CONF, 0o600)
     except OSError:
         pass
-    print(f"已生成 IPC token -> {BRIDGE_CONF}（HAP 下次命令自动读取）", file=sys.stderr)
+    print(f"已生成 IPC token -> {IPC_CONF}（HAP 下次命令自动读取）", file=sys.stderr)
     return token
 
 

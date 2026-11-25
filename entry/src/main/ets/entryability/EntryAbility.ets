@@ -119,7 +119,7 @@ export default class EntryAbility extends UIAbility {
   async startKeepAlive(): Promise<void> {
     try {
       const wants: Want[] = [{
-        bundleName: 'org.social4hyq.harbor',
+        bundleName: 'com.social4hyq.harbor',
         abilityName: 'EntryAbility',
         parameters: { fromNotification: true }
       }];
