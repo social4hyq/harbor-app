@@ -6,7 +6,9 @@
 
 运行：python3 test_harbor_clean.py
 """
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import tempfile
@@ -131,6 +133,80 @@ class TestStaleBrewApps(unittest.TestCase):
         self.assertEqual(disabled, [])  # 已禁用，无需再次禁用
         kept = harbor.prune_stale_brew_apps(cfg)
         self.assertEqual(kept, [])
+
+
+class TestNotFoundRendering(unittest.TestCase):
+    """not-found 状态（对齐 systemd 的失效 unit 语义）在 CLI 的展示。"""
+
+    def test_list_renders_not_found_with_cleanup_hint(self):
+        services = [
+            {"name": "mihomo", "pid": 123, "status": "started"},
+            {"name": "herdr-app", "pid": 0, "status": "not-found"},
+        ]
+        with mock.patch.object(harbor, "ipc", return_value="OK " + json.dumps(services)):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                harbor.cmd_list([])
+        text = out.getvalue()
+        self.assertIn("not-found", text)
+        self.assertIn("cleanup", text.lower())
+
+    def test_status_renders_not_found_hint(self):
+        services = [{"name": "herdr-app", "pid": 0, "status": "not-found"}]
+        with mock.patch.object(harbor, "ipc", return_value="OK " + json.dumps(services)):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                harbor.cmd_status([])
+        text = out.getvalue()
+        self.assertIn("not-found", text)
+        self.assertIn("cleanup", text.lower())
+
+
+class TestCleanupReload(unittest.TestCase):
+    """cleanup 写配置后应通知 HAP 立即重读，消除‘清了但列表还在’的困惑。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.opt = os.path.join(self.tmp.name, "opt")
+        self.brew_patch = mock.patch.object(harbor, "BREW_OPT", self.opt)
+        self.brew_patch.start()
+        self.addCleanup(self.brew_patch.stop)
+
+    def test_cleanup_soft_disable_sends_reload(self):
+        missing = os.path.join(self.opt, "herdr-app", "sh.brew.herdr-app.service")
+        cfg = {"apps": [{"name": "herdr-app", "type": "unit", "unit": missing,
+                         "pidfile": "/data/cache/harbor/herdr-app.pid"}]}
+        with mock.patch.object(harbor, "read_config", return_value=cfg), \
+             mock.patch.object(harbor, "write_config") as wc, \
+             mock.patch.object(harbor, "ipc", return_value='OK {"reloaded":true}') as ipc:
+            harbor.cmd_cleanup([])
+        wc.assert_called_once()
+        ipc.assert_any_call("RELOAD")
+
+    def test_cleanup_prune_sends_reload(self):
+        missing = os.path.join(self.opt, "herdr-app", "sh.brew.herdr-app.service")
+        cfg = {"apps": [{"name": "herdr-app", "type": "unit", "unit": missing,
+                         "pidfile": "/data/cache/harbor/herdr-app.pid"}]}
+        with mock.patch.object(harbor, "read_config", return_value=cfg), \
+             mock.patch.object(harbor, "write_config") as wc, \
+             mock.patch.object(harbor, "ipc", return_value='OK {"reloaded":true}') as ipc:
+            harbor.cmd_cleanup(["--prune"])
+        wc.assert_called_once()
+        ipc.assert_any_call("RELOAD")
+
+    def test_cleanup_no_change_skips_reload(self):
+        present = os.path.join(self.opt, "mihomo", "sh.brew.mihomo.service")
+        os.makedirs(os.path.dirname(present), exist_ok=True)
+        open(present, "w").close()
+        cfg = {"apps": [{"name": "mihomo", "type": "unit", "unit": present,
+                         "pidfile": "/data/cache/harbor/mihomo.pid"}]}
+        with mock.patch.object(harbor, "read_config", return_value=cfg), \
+             mock.patch.object(harbor, "write_config") as wc, \
+             mock.patch.object(harbor, "ipc", return_value='OK {}') as ipc:
+            harbor.cmd_cleanup([])
+        wc.assert_not_called()
+        ipc.assert_not_called()
 
 
 if __name__ == "__main__":

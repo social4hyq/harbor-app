@@ -173,9 +173,12 @@ def cmd_list(args):
     for s in services:
         status = s.get("status", "?")
         pid = s.get("pid", 0)
-        color = {"started": "\033[32m", "error": "\033[31m"}.get(status, "")
+        color = {"started": "\033[32m", "error": "\033[31m",
+                 "not-found": "\033[31m"}.get(status, "")
         reset = "\033[0m" if color else ""
         print(f"{s['name']:<{name_w}}  {color}{status:<12}{reset}  {pid if pid else '-'}")
+    if any(s.get("status") == "not-found" for s in services):
+        print("提示：not-found = brew formula 已卸载，运行 'harbor cleanup' 清理（--prune 彻底移除）。")
 
 
 def set_enabled(name: str, enabled: bool):
@@ -208,9 +211,13 @@ def cmd_simple(name: str, action: str):
 def cmd_status(args):
     services = parse_ok(ipc("STATUS"))
     target = args[0] if args else None
+    shown = []
     for s in services or []:
         if target is None or s["name"] == target:
             print(f"{s['name']}: {s.get('status')} (pid {s.get('pid') or '-'})")
+            shown.append(s)
+    if any(s.get("status") == "not-found" for s in shown):
+        print("提示：not-found = brew formula 已卸载，运行 'harbor cleanup' 清理（--prune 彻底移除）。")
 
 
 def cmd_set_timer(args):
@@ -289,6 +296,7 @@ def cmd_cleanup(args):
         for name in removed:
             print(f"已移除失效服务: {name}")
         print(f"共移除 {len(removed)} 项；如需恢复，重装 formula 后 'harbor discover --add <formula>'。")
+        _reload_after_cleanup()
     else:
         changed = disable_stale_brew_apps(cfg)
         if changed:
@@ -296,9 +304,19 @@ def cmd_cleanup(args):
             for name in changed:
                 print(f"已禁用失效服务: {name}（可逆）")
             print("清理完成。彻底移除请用: harbor cleanup --prune")
+            _reload_after_cleanup()
         else:
             print("失效服务均已禁用，无新增变更。")
             print("彻底移除请用: harbor cleanup --prune")
+
+
+def _reload_after_cleanup():
+    """cleanup 写配置后通知 HAP 立即重读，消除‘清了但列表还在’的困惑。
+    HAP 未启动或 IPC 失败时静默跳过（配置已落盘，下次启动自然生效）。"""
+    try:
+        parse_ok(ipc("RELOAD"))
+    except SystemExit:
+        pass
 
 
 def parse_unit_brief(path: str) -> dict:

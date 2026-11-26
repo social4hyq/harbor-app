@@ -5,6 +5,7 @@ import hilog from '@ohos.hilog';
 import { BusinessError } from '@ohos.base';
 import fileIo from '@ohos.file.fs';
 import daemonBridge from 'libharbor_bridge.so';
+import { brewUnitMissing } from './BrewUnit';
 
 const DOMAIN = 0x0000;
 const TAG = 'HarborIpc';
@@ -131,9 +132,12 @@ function statusJson(): string {
   for (const app of cfg.apps) {
     const pid: number = daemonBridge.pidFromPidfile(app.pidfile);
     const exists: number = daemonBridge.pidfileExists(app.pidfile);
-    // 对齐 brew status_symbol：started/stopped/none/disabled/error
+    // 对齐 brew status_symbol + systemd 的 not-found：
+    // brew unit 文件消失（formula 卸载）优先标 not-found，即使条目是 disabled 也要暴露。
     let status: string = 'none';
-    if (app.enabled === false) status = 'disabled';
+    if (app.type === 'unit' && app.unit && brewUnitMissing(app.unit)) {
+      status = 'not-found';
+    } else if (app.enabled === false) status = 'disabled';
     else if (pid > 0) status = 'started';
     else if (exists === 1) status = 'stopped';   // 有 pidfile 但进程已退
     // else none：从未启动过（无 pidfile）

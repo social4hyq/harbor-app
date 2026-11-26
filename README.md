@@ -42,6 +42,13 @@ authoritative signal is the unit file's existence on disk under `~/.harmonybrew/
 manually-managed units (e.g. `~/.config/daemonbox/units/`) and `type: exec`
 entries are never touched. `cleanup` defaults to a reversible soft-disable
 (`enabled: false`); `--prune` hard-removes the entries (re-add with `discover --add`).
+`cleanup` sends `RELOAD` to the HAP so the change appears immediately in `harbor list`.
+
+Such services also carry a `not-found` status in both `harbor list`/`status` and
+the HAP UI (mirroring systemd's not-found unit state), taking precedence over
+`disabled`. The HAP UI groups it under the "配置异常" filter and shows a cleanup
+hint in the detail pane. This closes the detect → display → clean loop across
+the CLI, IPC status, and UI layers.
 
 ## Config
 
