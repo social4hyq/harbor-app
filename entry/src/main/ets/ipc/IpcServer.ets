@@ -5,7 +5,7 @@ import hilog from '@ohos.hilog';
 import { BusinessError } from '@ohos.base';
 import fileIo from '@ohos.file.fs';
 import daemonBridge from 'libharbor_bridge.so';
-import { brewUnitMissing } from './BrewUnit';
+import { brewUnitMissing, cleanupBrewApps } from './BrewUnit';
 
 const DOMAIN = 0x0000;
 const TAG = 'HarborIpc';
@@ -135,8 +135,8 @@ function statusJson(): string {
     // 对齐 brew status_symbol + systemd 的 not-found：
     // brew unit 文件消失（formula 卸载）优先标 not-found，即使条目是 disabled 也要暴露。
     let status: string = 'none';
-    if (app.type === 'unit' && app.unit && brewUnitMissing(app.unit)) {
-      status = 'not-found';
+    if (app.type === 'unit' && app.unit && app.enabled !== false && brewUnitMissing(app.unit)) {
+      status = 'not-found';  // 未处理的失效项（已软禁用的显示 disabled，表示已处理）
     } else if (app.enabled === false) status = 'disabled';
     else if (pid > 0) status = 'started';
     else if (exists === 1) status = 'stopped';   // 有 pidfile 但进程已退
@@ -259,6 +259,12 @@ export class IpcServer {
       if (cmd === 'RELOAD') {
         // 重读配置由 STATUS/START 自然生效（每次都读文件），这里只是 ack
         return 'OK {"reloaded":true}\n';
+      }
+      if (cmd === 'CLEANUP') {
+        const prune: boolean = args.includes('--prune');
+        const name: string = args.find((a: string) => a !== '--prune') ?? '';
+        const result = cleanupBrewApps(name, prune);
+        return 'OK ' + JSON.stringify(result) + '\n';
       }
       return 'ERR unknown command\n';
     } catch (e) {

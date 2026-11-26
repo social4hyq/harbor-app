@@ -5,7 +5,7 @@ import common from '@ohos.app.ability.common';
 import { HarborIcon, Palette } from '../components/HarborAppearance';
 import { ServiceLog } from '../components/ServiceLog';
 import { applyTheme, saveTheme, THEME_STORAGE, ThemePreference } from '../components/ThemePreference';
-import { brewUnitMissing } from '../ipc/BrewUnit';
+import { brewUnitMissing, cleanupBrewApps, CleanupResult } from '../ipc/BrewUnit';
 
 const DOMAIN = 0x0000;
 const TAG = 'Harbor';
@@ -193,6 +193,8 @@ struct Index {
   @State updatedAt: string = '';
   @State pendingService: string = '';
   @State actionNotice: string = '';
+  @State cleanupNotice: string = '';
+  @State confirmRemove: boolean = false;
   private services: ServiceState[] = [];
   private refreshTimer: number = -1;
 
@@ -220,7 +222,7 @@ struct Index {
         let status: string = 'none';
         let pid: number = 0;
         const staleBrew: boolean = app.type === 'unit' && app.unit !== undefined &&
-          brewUnitMissing(app.unit);
+          app.enabled !== false && brewUnitMissing(app.unit);
         if (staleBrew) {
           status = 'not-found';  // brew 已卸载，优先于 disabled/进程状态
         } else if (app.enabled === false) {
@@ -361,6 +363,28 @@ struct Index {
       }
       this.pendingService = '';
     }, action === '重启' ? 1000 : 600);
+  }
+
+  // 清理失效的 brew 服务（与 CLI harbor cleanup 语义一致）。
+  // prune=false 软禁用（可逆）；prune=true 从 apps.json 移除。
+  private runCleanup(prune: boolean, name: string): void {
+    this.cleanupNotice = '';
+    this.confirmRemove = false;
+    const result: CleanupResult = cleanupBrewApps(name, prune);
+    if (result.error.length > 0) {
+      this.cleanupNotice = '清理失败：' + result.error;
+      return;
+    }
+    if (result.disabled.length === 0 && result.removed.length === 0) {
+      this.cleanupNotice = '没有需要清理的服务。';
+      return;
+    }
+    const what = result.removed.length > 0
+      ? '已移除 ' + result.removed.join('、')
+      : '已禁用 ' + result.disabled.join('、') + '（可逆）';
+    this.cleanupNotice = what;
+    this.actionNotice = '';
+    this.refresh();  // 立即重读配置，列表状态同步
   }
 
   private async changeTheme(index: number): Promise<void> {
@@ -512,6 +536,21 @@ struct Index {
         }
       }
       .width('100%').padding({ left: 12, right: 12, top: 6, bottom: 6 })
+      if (this.visibleServices.some((s: ServiceState) => s.status === 'not-found')) {
+        Row({ space: 8 }) {
+          Text(this.visibleServices.filter((s: ServiceState) => s.status === 'not-found').length +
+            ' 个 brew 服务已卸载').fontSize(12).fontColor(Palette.danger).layoutWeight(1)
+          Button('清理全部（禁用）', { type: ButtonType.Normal })
+            .id('cleanup-all').height(30).fontSize(12).fontColor(Palette.onAccent)
+            .backgroundColor(Palette.accent)
+            .onClick(() => { this.runCleanup(false, ''); })
+        }
+        .width('100%').padding({ left: 12, right: 12, top: 4, bottom: 8 })
+      }
+      if (this.cleanupNotice.length > 0) {
+        Text(this.cleanupNotice).fontSize(12).fontColor(Palette.muted)
+          .width('100%').padding({ left: 12, right: 12, bottom: 6 })
+      }
       Divider().color(Palette.line)
       if (this.visibleServices.length > 0) {
         Row({ space: 10 }) {
@@ -674,12 +713,42 @@ struct Index {
             }.width('100%')
           }
           if (this.selected.status === 'not-found') {
-            Text('brew formula 已卸载（unit 文件不存在）。运行 harbor cleanup 清理；' +
-              '彻底移除用 harbor cleanup --prune。')
-              .fontSize(12).fontColor(Palette.danger).width('100%')
+            Column({ space: 8 }) {
+              Text('brew formula 已卸载（unit 文件不存在），可在界面直接清理。')
+                .fontSize(12).fontColor(Palette.danger).width('100%')
+              if (!this.confirmRemove) {
+                Row({ space: 8 }) {
+                  Button('清理（禁用，可逆）', { type: ButtonType.Normal })
+                    .id('cleanup-soft-' + this.selected.name).height(34).layoutWeight(1)
+                    .fontSize(12).fontColor(Palette.onAccent).backgroundColor(Palette.accent)
+                    .onClick(() => { this.runCleanup(false, this.selected!.name); })
+                  Button('移除', { type: ButtonType.Normal })
+                    .id('cleanup-remove-' + this.selected.name).height(34).layoutWeight(1)
+                    .fontSize(12).fontColor(Palette.danger).backgroundColor(Palette.dangerSoft)
+                    .onClick(() => { this.confirmRemove = true; })
+                }.width('100%')
+              } else {
+                Row({ space: 8 }) {
+                  Text('确认从配置中移除？').fontSize(12).fontColor(Palette.ink).layoutWeight(1)
+                  Button('取消', { type: ButtonType.Normal }).height(34)
+                    .fontSize(12).fontColor(Palette.muted).backgroundColor(Palette.soft)
+                    .onClick(() => { this.confirmRemove = false; })
+                  Button('确认移除', { type: ButtonType.Normal }).height(34)
+                    .fontSize(12).fontColor(Palette.onAccent).backgroundColor(Palette.danger)
+                    .onClick(() => { this.runCleanup(true, this.selected!.name); })
+                }.width('100%')
+              }
+              if (this.cleanupNotice) {
+                Text(this.cleanupNotice).fontSize(12).fontColor(Palette.muted).width('100%')
+              }
+            }
+            .width('100%').padding(10).borderRadius(8).backgroundColor(Palette.dangerSoft)
           }
           if (this.actionNotice) {
             Text(this.actionNotice).fontSize(12).fontColor(Palette.muted)
+          }
+          if (this.selected.status !== 'not-found' && this.cleanupNotice) {
+            Text(this.cleanupNotice).fontSize(12).fontColor(Palette.accent).width('100%')
           }
           Row({ space: 3 }) {
             this.detailTab('overview', '概览')
