@@ -9,7 +9,7 @@
   status <name>     单个服务状态
   info <name>       服务详情（Command/Log/Env）
   discover          扫描已装 brew formula 的 .service，提示可加入的服务
-  cleanup           提示清理已移除服务的残留 pidfile
+  cleanup           清理已卸载 brew formula 的失效服务（默认软禁用；--prune 彻底移除）
   set-autohide <t|f> 设置启动时是否自动隐藏到托盘（开机自启场景设 true）
   set-timer <name> cron <OnCalendar> | interval <秒> | off   设置/取消定时任务
   reload            让 HAP 重读配置
@@ -29,6 +29,65 @@ PORT = 19876
 CONFIG = os.path.expanduser("~/.config/harbor/apps.json")
 IPC_CONF = os.path.expanduser("~/.config/harbor/ipc.conf")
 CELLAR = os.path.expanduser("~/.harmonybrew/Cellar")
+BREW_OPT = os.path.expanduser("~/.harmonybrew/opt")
+
+
+def is_brew_unit(unit: str) -> bool:
+    """是否 brew 管理的 unit（稳定 opt/ 路径）。判据对齐 brew services cleanup：
+    只有后端 brew 生成的 unit 才归 brew 清理，手工 unit 一律跳过。"""
+    try:
+        return os.path.commonpath([os.path.abspath(unit), os.path.abspath(BREW_OPT)]) == \
+            os.path.abspath(BREW_OPT)
+    except ValueError:
+        return False
+
+
+def find_stale_brew_apps(cfg: dict) -> list:
+    """找出 brew 已卸载的服务：brew unit 文件已不在磁盘。
+    对齐 brew services cleanup 的权威信号（dest.file? 不存在），
+    仅检测、不修改 cfg。"""
+    stale = []
+    for app in cfg.get("apps", []):
+        if app.get("type") != "unit":
+            continue
+        unit = app.get("unit", "")
+        if not unit or not is_brew_unit(unit):
+            continue
+        if not os.path.exists(unit):
+            stale.append(app)
+    return stale
+
+
+def disable_stale_brew_apps(cfg: dict) -> list:
+    """默认清理：把失效的 brew 服务标记 enabled:false（可逆，重装后可恢复）。
+    返回本次新禁用（原本未禁用）的服务名列表。"""
+    changed = []
+    for app in find_stale_brew_apps(cfg):
+        if app.get("enabled") is not False:
+            app["enabled"] = False
+            changed.append(app["name"])
+    return changed
+
+
+def prune_stale_brew_apps(cfg: dict) -> list:
+    """--prune 清理：从 cfg['apps'] 彻底移除失效的 brew 服务。
+    直接返回保留的 apps 列表，不修改 cfg['apps'] 之外的字段。"""
+    stale_names = {app["name"] for app in find_stale_brew_apps(cfg)}
+    return [app for app in cfg.get("apps", []) if app["name"] not in stale_names]
+
+
+def report_stale_brew_apps(cfg: dict, verb: str = "发现") -> int:
+    """CLI 每次运行入口调用：只提示、不改配置（对齐 systemd 的 not-found 状态展示）。
+    返回失效项数量，0 表示干净。"""
+    stale = find_stale_brew_apps(cfg)
+    if not stale:
+        return 0
+    print(f"[{verb}] {len(stale)} 个 brew 服务已失效（unit 文件不存在，formula 可能已卸载）：",
+          file=sys.stderr)
+    for app in stale:
+        print(f"    - {app['name']}: {app.get('unit', '')}", file=sys.stderr)
+    print("    运行 'harbor cleanup' 清理；'harbor cleanup --prune' 彻底移除。", file=sys.stderr)
+    return len(stale)
 
 
 def read_token() -> str:
@@ -209,17 +268,37 @@ def cmd_set_autohide(args):
 
 
 def cmd_cleanup(args):
-    """清理已移除服务的残留 pidfile（对齐 brew services cleanup）。
+    """清理 brew 已卸载服务的失效条目（对齐 brew services cleanup）。
 
-    pidfile 在 HAP 沙箱内 CLI 看不到，通过 HAP 侧 STATUS 无法列出已移除服务。
-    这里只能提示用户在 HAP 内清理，或重启 HAP 时自动清理（v3）。
+    默认：把失效的 brew 服务标记 enabled:false（可逆，重装 formula 后可再启用）。
+    --prune：从 apps.json 彻底移除失效条目。
+    判据统一为 brew unit 文件是否还在磁盘（仅 opt/ 路径，手工 unit 一律跳过）。
     """
+    prune = "--prune" in args
     cfg = read_config()
-    names = {a["name"] for a in cfg["apps"]}
-    print("当前配置服务: " + ", ".join(sorted(names)))
-    print("提示：已从 apps.json 移除的服务，其 pidfile 位于 HAP 沙箱")
-    print("      /data/storage/el2/base/cache/harbor/<name>.pid，重启 HAP 时会自动忽略。")
-    print("      （HAP 侧自动清理将在 v3 实现；当前不影响功能。）")
+    stale_before = find_stale_brew_apps(cfg)
+    if not stale_before:
+        print("所有 brew 服务状态正常，无需清理。")
+        return
+
+    if prune:
+        kept = prune_stale_brew_apps(cfg)
+        removed = [a["name"] for a in stale_before]
+        cfg["apps"] = kept
+        write_config(cfg)
+        for name in removed:
+            print(f"已移除失效服务: {name}")
+        print(f"共移除 {len(removed)} 项；如需恢复，重装 formula 后 'harbor discover --add <formula>'。")
+    else:
+        changed = disable_stale_brew_apps(cfg)
+        if changed:
+            write_config(cfg)
+            for name in changed:
+                print(f"已禁用失效服务: {name}（可逆）")
+            print("清理完成。彻底移除请用: harbor cleanup --prune")
+        else:
+            print("失效服务均已禁用，无新增变更。")
+            print("彻底移除请用: harbor cleanup --prune")
 
 
 def parse_unit_brief(path: str) -> dict:
@@ -381,6 +460,15 @@ def main():
         print(f"ERR 未知子命令: {sub}", file=sys.stderr)
         print(__doc__, file=sys.stderr)
         sys.exit(2)
+    # 每次 CLI 运行自动检测失效的 brew 服务（只提示、不改配置）。
+    # 提示走 stderr，不污染 pong/list 等 stdout 输出；排除 cleanup（它自己处理）与 help（纯帮助）。
+    if sub not in ("cleanup", "-h", "--help"):
+        try:
+            report_stale_brew_apps(read_config())
+        except SystemExit:
+            pass
+        except (OSError, ValueError, KeyError):
+            pass  # 检测失败不阻断主命令
     handlers[sub](rest)
 
 

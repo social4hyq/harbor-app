@@ -30,8 +30,18 @@ harbor set-timer mihomo cron '*-*-* 03:00:00'
 harbor set-timer mihomo interval 3600
 harbor set-timer mihomo off
 harbor set-autohide true                 # hide to tray on launch (boot autostart)
-harbor cleanup / reload / ping
+harbor cleanup                           # disable stale brew services (reversible)
+harbor cleanup --prune                   # remove them from apps.json entirely
+harbor reload / ping
 ```
+
+Every CLI invocation auto-detects brew services whose unit file has disappeared
+(i.e. the formula was uninstalled) and prints a hint to stderr. Detection is
+read-only; use `harbor cleanup` to act. Mirroring `brew services cleanup`, the
+authoritative signal is the unit file's existence on disk under `~/.harmonybrew/opt/`;
+manually-managed units (e.g. `~/.config/daemonbox/units/`) and `type: exec`
+entries are never touched. `cleanup` defaults to a reversible soft-disable
+(`enabled: false`); `--prune` hard-removes the entries (re-add with `discover --add`).
 
 ## Config
 
