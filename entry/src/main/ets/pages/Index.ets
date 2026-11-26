@@ -1,24 +1,34 @@
 import daemonBridge from 'libharbor_bridge.so';
 import hilog from '@ohos.hilog';
 import fileIo from '@ohos.file.fs';
+import common from '@ohos.app.ability.common';
+import { HarborIcon, Palette } from '../components/HarborAppearance';
+import { ServiceLog } from '../components/ServiceLog';
+import { applyTheme, saveTheme, THEME_STORAGE, ThemePreference } from '../components/ThemePreference';
+import { brewUnitMissing } from '../ipc/BrewUnit';
 
 const DOMAIN = 0x0000;
 const TAG = 'Harbor';
 const CONFIG_PATH = '/storage/Users/currentUser/.config/harbor/apps.json';
 
-// ---- 配色 ----
-const C_BLUE: string = '#1565C0';
-const C_BLUE_LIGHT: string = '#1E88E5';
-const C_GREEN: string = '#2E7D32';
-const C_GREEN_BG: string = '#E8F5E9';
-const C_GRAY: string = '#90A4AE';
-const C_GRAY_BG: string = '#ECEFF1';
-const C_RED: string = '#C62828';
-const C_RED_BG: string = '#FFEBEE';
-const C_INK: string = '#263238';
-const C_SUB: string = '#78909C';
-const C_CARD: string = '#FFFFFF';
-const C_PAGE_BG: string = '#F4F7FB';
+const CONFIG_LABEL = '~/.config/harbor/apps.json';
+const WIDE_WINDOW = 970;
+const THEME_VALUES: ThemePreference[] = [ThemePreference.System, ThemePreference.Light, ThemePreference.Dark];
+const THEME_OPTIONS: SelectOption[] = [{ value: '跟随系统' }, { value: '浅色' }, { value: '深色' }];
+
+interface ServiceFilter {
+  id: string;
+  label: string;
+  icon: string;
+}
+
+const FILTERS: ServiceFilter[] = [
+  { id: 'all', label: '全部服务', icon: 'list' },
+  { id: 'started', label: '运行中', icon: 'activity' },
+  { id: 'inactive', label: '未运行', icon: 'pause' },
+  { id: 'disabled', label: '已禁用', icon: 'disabled' },
+  { id: 'error', label: '配置异常', icon: 'warning' }
+];
 
 // ---- 数据模型 ----
 interface TimerSpec {
@@ -51,11 +61,12 @@ interface SvcResult {
 interface ServiceState {
   name: string;
   type: string;
-  status: string;             // started | stopped | none | disabled | error
+  status: string;             // started | stopped | none | disabled | error | not-found
   pid: number;
   enabled: boolean;
   timerText: string;
   bin: string;
+  unit: string;
   args: string[];
   log: string;
   pidfile: string;
@@ -139,38 +150,56 @@ function statusText(s: string): string {
   if (s === 'started') return '运行中';
   if (s === 'stopped') return '已停止';
   if (s === 'disabled') return '已禁用';
-  if (s === 'error') return '异常';
+  if (s === 'not-found') return '已卸载';
+  if (s === 'error') return '配置异常';
   return '未启动';
 }
 
-function statusColor(s: string): string {
-  if (s === 'started') return C_GREEN;
-  if (s === 'disabled' || s === 'none') return C_GRAY;
-  if (s === 'error') return C_RED;
-  return C_SUB;
+function statusColor(s: string): ResourceColor {
+  if (s === 'started') return Palette.accent;
+  if (s === 'error' || s === 'not-found') return Palette.danger;
+  if (s === 'stopped' || s === 'none') return Palette.amber;
+  return Palette.muted;
 }
 
-function statusBg(s: string): string {
-  if (s === 'started') return C_GREEN_BG;
-  if (s === 'error') return C_RED_BG;
-  return C_GRAY_BG;
+function matchesService(service: ServiceState, filter: string, query: string): boolean {
+  const status = service.status;
+  const isIssue = status === 'error' || status === 'not-found';
+  return (filter === 'all' || filter === status ||
+    (filter === 'error' && isIssue) ||
+    (filter === 'inactive' && (status === 'stopped' || status === 'none'))) &&
+    service.name.toLowerCase().includes(query.trim().toLowerCase());
 }
 
 @Entry
 @Component
 struct Index {
-  @State services: ServiceState[] = [];
+  @StorageLink(THEME_STORAGE) theme: ThemePreference = ThemePreference.System;
+  @State themeSaving: boolean = false;
+  @State themeMessage: string = '';
+  @State visibleServices: ServiceState[] = [];
+  @State selected: ServiceState | undefined = undefined;
+  @State filter: string = 'all';
+  @State query: string = '';
+  @State tab: string = 'overview';
+  @State wide: boolean = false;
+  @State showDetail: boolean = false;
+  @State serviceCount: number = 0;
   @State runningCount: number = 0;
   @State stoppedCount: number = 0;
   @State disabledCount: number = 0;
-  @State headerInfo: string = '正在读取配置…';
+  @State errorCount: number = 0;
+  @State configFailed: boolean = false;
   @State updatedAt: string = '';
+  @State pendingService: string = '';
+  @State actionNotice: string = '';
+  private services: ServiceState[] = [];
   private refreshTimer: number = -1;
 
   // 读配置 -> 解析每个服务 -> 查 pidfile 得到状态
   refresh(): void {
     const next: ServiceState[] = [];
-    let running = 0, stopped = 0, disabled = 0;
+    let running = 0, stopped = 0, disabled = 0, errors = 0;
     try {
       const text = fileIo.readTextSync(CONFIG_PATH);
       const cfg = JSON.parse(text) as AppsConfig;
@@ -190,7 +219,11 @@ struct Index {
         }
         let status: string = 'none';
         let pid: number = 0;
-        if (app.enabled === false) {
+        const staleBrew: boolean = app.type === 'unit' && app.unit !== undefined &&
+          brewUnitMissing(app.unit);
+        if (staleBrew) {
+          status = 'not-found';  // brew 已卸载，优先于 disabled/进程状态
+        } else if (app.enabled === false) {
           status = 'disabled';
         } else {
           pid = daemonBridge.pidFromPidfile(app.pidfile);
@@ -200,6 +233,7 @@ struct Index {
         }
         if (status === 'started') running++;
         else if (status === 'disabled') disabled++;
+        else if (status === 'error') errors++;
         else stopped++;
         next.push({
           name: app.name,
@@ -209,21 +243,25 @@ struct Index {
           enabled: app.enabled !== false,
           timerText: formatTimer(app.timer),
           bin: bin,
+          unit: app.unit ?? '',
           args: args,
           log: log,
           pidfile: app.pidfile,
           env: env
         });
       }
-      this.headerInfo = '配置文件已加载';
+      this.configFailed = false;
     } catch (err) {
-      this.headerInfo = '读取配置失败: ' + JSON.stringify(err);
+      this.configFailed = true;
       hilog.error(DOMAIN, TAG, 'read config failed: %{public}s', JSON.stringify(err));
     }
     this.services = next;
+    this.serviceCount = next.length;
     this.runningCount = running;
     this.stoppedCount = stopped;
     this.disabledCount = disabled;
+    this.errorCount = errors;
+    this.updateVisibleServices();
     const now = new Date();
     this.updatedAt = ('0' + now.getHours()).slice(-2) + ':' +
                       ('0' + now.getMinutes()).slice(-2) + ':' +
@@ -272,188 +310,458 @@ struct Index {
     if (this.refreshTimer >= 0) clearInterval(this.refreshTimer);
   }
 
-  build() {
-    Stack() {
-      Column() {
-        // 顶部品牌横幅
-        Column({ space: 0 }) {
-          Row({ space: 12 }) {
-            Stack() {
-              Circle({ width: 48, height: 48 }).fill('#33FFFFFF')
-              Image($r('app.media.foreground'))
-                .width(30).height(30).objectFit(ImageFit.Contain)
-            }
-            .width(48).height(48)
-            Column({ space: 2 }) {
-              Text('Harbor')
-                .fontSize(24).fontColor(Color.White).fontWeight(FontWeight.Bold)
-              Text('常驻服务管理器')
-                .fontSize(12).fontColor('#C8E6FF')
-            }
-            .layoutWeight(1)
-            .alignItems(HorizontalAlign.Start)
-            Column({ space: 2 }) {
-              Text(this.runningCount + '/' + this.services.length)
-                .fontSize(20).fontColor(Color.White).fontWeight(FontWeight.Bold)
-              Text('运行中')
-                .fontSize(10).fontColor('#C8E6FF')
-            }
-            .alignItems(HorizontalAlign.Center)
-          }
-          .width('100%')
-          .padding({ left: 20, right: 20, top: 16, bottom: 16 })
+  private updateVisibleServices(): void {
+    const visible = this.services.filter((service: ServiceState) => matchesService(service, this.filter, this.query));
+    const selectedId = this.selected?.pidfile;
+    // Keep the selected service visible while an action moves it out of the current filter.
+    const selected = this.services.find((service: ServiceState) => service.pidfile === selectedId);
+    this.visibleServices = visible;
+    this.selected = selected ?? visible[0];
+    if (!this.selected) this.showDetail = false;
+    if (selectedId !== this.selected?.pidfile) {
+      this.tab = 'overview';
+      this.actionNotice = '';
+    }
+  }
+
+  private applyFilter(filter: string, query: string): void {
+    this.filter = filter;
+    this.query = query;
+    if (this.selected && !matchesService(this.selected, filter, query)) {
+      this.selected = undefined;
+      this.tab = 'overview';
+      this.actionNotice = '';
+    }
+    this.updateVisibleServices();
+  }
+
+  private selectService(service: ServiceState): void {
+    this.selected = this.services.find((current: ServiceState) => current.pidfile === service.pidfile);
+    this.tab = 'overview';
+    this.actionNotice = '';
+    this.showDetail = true;
+  }
+
+  private runAction(action: string): void {
+    const service = this.selected;
+    if (!service || this.pendingService || !service.enabled || !service.bin) return;
+    this.pendingService = service.pidfile;
+    this.actionNotice = action + '中…';
+    if (action !== '启动') this.stopOne(service);
+    if (action === '启动') this.startOne(service);
+    if (action === '重启') setTimeout(() => { this.startOne(service); }, 400);
+    setTimeout(() => {
+      this.refresh();
+      const current = this.services.find((item: ServiceState) => item.pidfile === service.pidfile);
+      const running = current?.status === 'started';
+      if (this.selected?.pidfile === service.pidfile) {
+        const confirmed = !this.configFailed && current !== undefined &&
+          (action === '停止' ? !running : running && (action !== '重启' || current.pid !== service.pid));
+        this.actionNotice = confirmed ? action + '完成' : '暂未确认' + action + '结果，请查看状态或日志';
+      }
+      this.pendingService = '';
+    }, action === '重启' ? 1000 : 600);
+  }
+
+  private async changeTheme(index: number): Promise<void> {
+    const next = THEME_VALUES[index];
+    if (!next || this.themeSaving || next === this.theme) return;
+    const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
+    this.themeMessage = '';
+    try {
+      applyTheme(context, next);
+    } catch (error) {
+      this.themeMessage = '无法切换主题，请重试';
+      return;
+    }
+    this.theme = next;
+    this.themeSaving = true;
+    try {
+      await saveTheme(context, next);
+    } catch (error) {
+      this.themeMessage = '主题已切换，保存失败';
+    } finally {
+      this.themeSaving = false;
+    }
+  }
+
+  @Builder
+  brand() {
+    Row({ space: 10 }) {
+      Row() {
+        HarborIcon({ name: 'anchor', tint: Palette.rail, iconSize: 26 })
+      }
+      .width(36).height(36).justifyContent(FlexAlign.Center)
+      .borderRadius(10).backgroundColor(Palette.mint)
+      Text('Harbor').fontSize(22).fontWeight(FontWeight.Bold).fontColor(Color.White)
+    }
+  }
+
+  @Builder
+  filterButton(item: ServiceFilter, sidebar: boolean) {
+    Button({ type: ButtonType.Normal }) {
+      Row({ space: 9 }) {
+        if (sidebar) {
+          HarborIcon({ name: item.icon, tint: this.filter === item.id ? Palette.mint : Palette.railMuted })
         }
-        .width('100%')
-        .linearGradient({ angle: 135, colors: [[C_BLUE_LIGHT, 0], [C_BLUE, 1]] })
-        .borderRadius({ bottomLeft: 24, bottomRight: 24 })
-        .shadow({ radius: 12, color: '#1A1565C0', offsetY: 4 })
+        Text(item.label).fontSize(13).fontWeight(this.filter === item.id ? FontWeight.Bold : FontWeight.Medium)
+          .fontColor(sidebar ? (this.filter === item.id ? Palette.mint : Palette.railText) :
+            (this.filter === item.id ? Palette.accent : Palette.muted))
+      }
+      .width(sidebar ? '100%' : undefined)
+    }
+    .id('filter-' + item.id)
+    .height(sidebar ? 42 : 34).borderRadius(8)
+    .padding({ left: 11, right: 11 })
+    .backgroundColor(this.filter === item.id ? (sidebar ? Palette.railSelected : Palette.selected) : Color.Transparent)
+    .onClick(() => { this.applyFilter(item.id, this.query); })
+  }
 
-        // 内容区
-        Column({ space: 12 }) {
-          // 统计行（内联，保证 @State 变化实时刷新）
-          Row({ space: 10 }) {
-            Column({ space: 2 }) {
-              Text(this.runningCount.toString()).fontSize(26).fontColor(C_GREEN).fontWeight(FontWeight.Bold)
-              Text('运行中').fontSize(11).fontColor(C_SUB)
-            }
-            .layoutWeight(1).padding({ top: 10, bottom: 10 })
-            .backgroundColor(C_CARD).borderRadius(14)
-            .shadow({ radius: 6, color: '#12263238', offsetY: 1 })
+  @Builder
+  sidebar() {
+    Column({ space: 5 }) {
+      this.brand()
+      Divider().color(Palette.railSelected).margin({ top: 20, bottom: 16 })
+      ForEach(FILTERS, (item: ServiceFilter) => {
+        this.filterButton(item, true)
+      }, (item: ServiceFilter) => item.id)
+      Blank()
+      Row({ space: 8 }) {
+        HarborIcon({ name: 'device', tint: Palette.railMuted })
+        Text('本机服务').fontSize(12).fontColor(Palette.railText)
+      }
+      .padding(10)
+    }
+    .width(176).height('100%').padding({ left: 14, right: 14, top: 24, bottom: 14 })
+    .alignItems(HorizontalAlign.Start).backgroundColor(Palette.rail)
+  }
 
-            Column({ space: 2 }) {
-              Text(this.stoppedCount.toString()).fontSize(26).fontColor(C_BLUE).fontWeight(FontWeight.Bold)
-              Text('已停止').fontSize(11).fontColor(C_SUB)
-            }
-            .layoutWeight(1).padding({ top: 10, bottom: 10 })
-            .backgroundColor(C_CARD).borderRadius(14)
-            .shadow({ radius: 6, color: '#12263238', offsetY: 1 })
+  @Builder
+  summary() {
+    Row() {
+      ServiceMetric({ label: '服务总数', value: this.serviceCount, tint: Palette.ink, wide: this.wide })
+      Divider().vertical(true).height(34).color(Palette.line)
+      ServiceMetric({ label: '运行中', value: this.runningCount, tint: Palette.accent, wide: this.wide })
+      Divider().vertical(true).height(34).color(Palette.line)
+      ServiceMetric({ label: '未运行', value: this.stoppedCount, tint: Palette.amber, wide: this.wide })
+      Divider().vertical(true).height(34).color(Palette.line)
+      ServiceMetric({ label: '已禁用', value: this.disabledCount, tint: Palette.muted, wide: this.wide })
+      if (this.errorCount > 0) {
+        Divider().vertical(true).height(34).color(Palette.line)
+        ServiceMetric({ label: '异常', value: this.errorCount, tint: Palette.danger, wide: this.wide })
+      }
+    }
+    .width('100%').backgroundColor(Palette.surface).borderRadius(12)
+    .border({ color: Palette.line, width: 1 })
+  }
 
-            Column({ space: 2 }) {
-              Text(this.disabledCount.toString()).fontSize(26).fontColor(C_GRAY).fontWeight(FontWeight.Bold)
-              Text('已禁用').fontSize(11).fontColor(C_SUB)
-            }
-            .layoutWeight(1).padding({ top: 10, bottom: 10 })
-            .backgroundColor(C_CARD).borderRadius(14)
-            .shadow({ radius: 6, color: '#12263238', offsetY: 1 })
-          }
-          .width('100%')
-
-          // 分区标题
-          Row() {
-            Text('服务列表')
-              .fontSize(14).fontColor(C_INK).fontWeight(FontWeight.Bold)
-            Blank()
-            Text('更新于 ' + this.updatedAt)
-              .fontSize(11).fontColor(C_SUB)
-          }
-          .width('100%')
-          .margin({ top: 4 })
-
-          // 服务卡片列表
-          if (this.services.length === 0) {
-            Column({ space: 8 }) {
-              Text('📭').fontSize(36)
-              Text('暂无服务')
-                .fontSize(15).fontColor(C_SUB)
-              Text('在 ~/.config/harbor/apps.json 中添加服务配置')
-                .fontSize(11).fontColor(C_SUB)
-            }
-            .width('100%').padding(30)
-            .backgroundColor(C_CARD).borderRadius(16)
-          } else {
-            List({ space: 10 }) {
-              ForEach(this.services, (s: ServiceState) => {
-                ListItem() {
-                  Column() {
-                    Row({ space: 12 }) {
-                      // 蓝色圆形锚图标
-                      Stack() {
-                        Circle({ width: 42, height: 42 }).fill(C_BLUE)
-                        Image($r('app.media.foreground'))
-                          .width(24).height(24).objectFit(ImageFit.Contain)
-                      }
-                      .width(42).height(42)
-
-                      Column({ space: 3 }) {
-                        Text(s.name)
-                          .fontSize(16).fontColor(C_INK).fontWeight(FontWeight.Bold)
-                          .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-                        Row({ space: 6 }) {
-                          Text(s.type.toUpperCase())
-                            .fontSize(10).fontColor(C_SUB)
-                            .padding({ left: 6, right: 6, top: 1, bottom: 1 })
-                            .borderRadius(4).backgroundColor(C_GRAY_BG)
-                          if (s.timerText.length > 0) {
-                            Text('⏱ ' + s.timerText)
-                              .fontSize(10).fontColor(C_BLUE)
-                              .padding({ left: 6, right: 6, top: 1, bottom: 1 })
-                              .borderRadius(4).backgroundColor('#E3F2FD')
-                          }
-                        }
-                      }
-                      .layoutWeight(1)
-                      .alignItems(HorizontalAlign.Start)
-
-                      // 状态徽章（内联）
-                      Row({ space: 6 }) {
-                        Circle({ width: 8, height: 8 }).fill(statusColor(s.status))
-                        Text(statusText(s.status))
-                          .fontSize(12).fontColor(statusColor(s.status)).fontWeight(FontWeight.Medium)
-                      }
-                      .padding({ left: 10, right: 10, top: 5, bottom: 5 })
-                      .borderRadius(20)
-                      .backgroundColor(statusBg(s.status))
-                    }
-                    .width('100%')
-
-                    Row({ space: 10 }) {
-                      Text(s.status === 'started' ? ('PID ' + s.pid) : (s.bin.length > 0 ? s.bin.split('/').slice(-1)[0] : '无 ExecStart'))
-                        .fontSize(11).fontColor(C_SUB)
-                        .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-                        .layoutWeight(1)
-
-                      if (s.status === 'started') {
-                        Button('重启')
-                          .fontSize(12).fontColor(C_BLUE).backgroundColor('#E3F2FD')
-                          .height(30).padding({ left: 14, right: 14 })
-                          .onClick(() => { this.stopOne(s); setTimeout(() => { this.startOne(s); this.refresh(); }, 400); })
-                        Button('停止')
-                          .fontSize(12).fontColor(C_RED).backgroundColor(C_RED_BG)
-                          .height(30).padding({ left: 14, right: 14 })
-                          .onClick(() => { this.stopOne(s); setTimeout(() => { this.refresh(); }, 400); })
-                      } else if (s.enabled) {
-                        Button('启动')
-                          .fontSize(12).fontColor(Color.White).backgroundColor(C_BLUE)
-                          .height(30).padding({ left: 16, right: 16 })
-                          .onClick(() => { this.startOne(s); setTimeout(() => { this.refresh(); }, 600); })
-                      }
-                    }
-                    .width('100%')
-                    .margin({ top: 12 })
-                  }
-                  .padding(14)
-                  .width('100%')
-                  .borderRadius(16)
-                  .backgroundColor(C_CARD)
-                  .shadow({ radius: 8, color: '#1A263238', offsetX: 0, offsetY: 2 })
-                  .border({ width: { left: 3 }, color: statusColor(s.status) })
-                }
-              }, (s: ServiceState) => s.name + '_' + s.status + '_' + s.pid)
-            }
-            .width('100%')
-            .layoutWeight(1)
-            .edgeEffect(EdgeEffect.Spring)
-          }
+  @Builder
+  serviceRow(service: ServiceState) {
+    Button({ type: ButtonType.Normal }) {
+      Row({ space: 10 }) {
+        Row() {
+          HarborIcon({ name: service.type === 'unit' ? 'layers' : 'terminal', tint: Palette.accent })
         }
-        .width('100%')
-        .layoutWeight(1)
-        .padding({ left: 16, right: 16, top: 16 })
+        .width(34).height(34).justifyContent(FlexAlign.Center)
+        .borderRadius(8).backgroundColor(Palette.selected)
+        Column({ space: 3 }) {
+          Text(service.name).fontSize(14).fontWeight(FontWeight.Bold).fontColor(Palette.ink)
+            .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+          Text(service.type === 'unit' ? 'Systemd 单元' : '可执行程序')
+            .fontSize(11).fontColor(Palette.muted).maxLines(1)
+        }
+        .layoutWeight(1).alignItems(HorizontalAlign.Start)
+        Row() { StatusBadge({ status: service.status }) }.width(82)
+        if (this.wide) {
+          Text(service.pid > 0 ? service.pid.toString() : '—')
+            .fontSize(12).fontFamily('monospace').fontColor(Palette.muted).width(55).maxLines(1)
+        }
+        HarborIcon({ name: 'chevron', tint: Palette.muted })
       }
       .width('100%')
-      .height('100%')
-      .backgroundColor(C_PAGE_BG)
     }
-    .width('100%')
-    .height('100%')
+    .id('service-' + service.name)
+    .width('100%').height(58).borderRadius(0).padding({ left: 12, right: 8 })
+    .backgroundColor(this.wide && this.selected?.pidfile === service.pidfile ? Palette.selected : Palette.surface)
+    .onClick(() => { this.selectService(service); })
+  }
+
+  @Builder
+  emptyState(icon: string, title: string, detail: string) {
+    Column({ space: 10 }) {
+      Row() { HarborIcon({ name: icon, tint: Palette.accent }) }
+        .width(42).height(42).justifyContent(FlexAlign.Center).borderRadius(11).backgroundColor(Palette.selected)
+      Text(title).fontSize(15).fontWeight(FontWeight.Bold).fontColor(Palette.ink).textAlign(TextAlign.Center)
+      Text(detail).fontSize(12).fontColor(Palette.muted).textAlign(TextAlign.Center).wordBreak(WordBreak.BREAK_ALL)
+    }
+    .width('100%').layoutWeight(1).padding(18).justifyContent(FlexAlign.Center)
+  }
+
+  @Builder
+  serviceTable() {
+    Column() {
+      Row({ space: 8 }) {
+        HarborIcon({ name: 'search', tint: Palette.muted })
+        TextInput({ placeholder: '按名称搜索服务', text: this.query })
+          .id('search-services').layoutWeight(1).height(36).fontSize(13).fontColor(Palette.ink)
+          .placeholderColor(Palette.muted).backgroundColor(Color.Transparent).padding(0)
+          .cancelButton({ style: CancelButtonStyle.INPUT })
+          .onChange((value: string) => { this.applyFilter(this.filter, value); })
+        if (this.wide) {
+          Text(this.visibleServices.length + ' 项').fontSize(12).fontColor(Palette.muted)
+        }
+      }
+      .width('100%').padding({ left: 12, right: 12, top: 6, bottom: 6 })
+      Divider().color(Palette.line)
+      if (this.visibleServices.length > 0) {
+        Row({ space: 10 }) {
+          Text('服务名称').layoutWeight(1).fontSize(12).fontColor(Palette.muted)
+          Text('状态').width(82).fontSize(12).fontColor(Palette.muted)
+          if (this.wide) {
+            Text('PID').width(55).fontSize(12).fontColor(Palette.muted)
+          }
+          Blank().width(20)
+        }
+        .width('100%').height(32).padding({ left: 12, right: 8 }).backgroundColor(Palette.soft)
+        List() {
+          ForEach(this.visibleServices, (service: ServiceState) => {
+            ListItem() { this.serviceRow(service) }
+          }, (service: ServiceState) => JSON.stringify([service.pidfile, service.name, service.type, service.status,
+            service.pid]))
+        }
+        .width('100%').layoutWeight(1).divider({ strokeWidth: 1, color: Palette.line })
+        .edgeEffect(EdgeEffect.None)
+      } else if (this.configFailed) {
+        this.emptyState('warning', '无法读取服务配置', CONFIG_LABEL)
+      } else if (this.serviceCount === 0) {
+        this.emptyState('layers', '尚未配置服务', '在 ' + CONFIG_LABEL + ' 中添加服务')
+      } else {
+        this.emptyState('search', '没有匹配的服务', '试试其他名称或状态筛选')
+      }
+    }
+    .width('100%').layoutWeight(1).clip(true).borderRadius(12).backgroundColor(Palette.surface)
+    .border({ color: Palette.line, width: 1 })
+  }
+
+  @Builder
+  workspace() {
+    Column({ space: 14 }) {
+      Row({ space: 8 }) {
+        Column({ space: 4 }) {
+          Text('服务管理').fontSize(27).fontWeight(FontWeight.Bold).fontColor(Palette.ink)
+          if (this.updatedAt) {
+            Text('更新于 ' + this.updatedAt).fontSize(12).fontColor(Palette.muted)
+          }
+        }
+        .layoutWeight(1).alignItems(HorizontalAlign.Start)
+        Select(THEME_OPTIONS)
+          .id('appearance-select').accessibilityDescription('界面主题')
+          .selected(THEME_VALUES.indexOf(this.theme)).value(THEME_OPTIONS[THEME_VALUES.indexOf(this.theme)].value)
+          .font({ size: 13, weight: FontWeight.Medium }).fontColor(Palette.ink)
+          .height(36).backgroundColor(Palette.surface).borderRadius(8)
+          .border({ color: Palette.line, width: 1 }).enabled(!this.themeSaving)
+          .onSelect((index: number) => { void this.changeTheme(index); })
+        Button({ type: ButtonType.Normal }) {
+          Row({ space: 6 }) {
+            HarborIcon({ name: 'refresh', tint: Palette.ink, iconSize: 22 })
+            Text('刷新').fontSize(13).fontWeight(FontWeight.Medium).fontColor(Palette.ink)
+          }
+        }
+        .id('refresh-services').height(36).padding({ left: 10, right: 12 }).borderRadius(8)
+        .backgroundColor(Palette.surface).border({ color: Palette.line, width: 1 })
+        .onClick(() => { this.refresh(); })
+      }
+      .width('100%')
+      if (this.themeMessage) {
+        Text(this.themeMessage).width('100%').fontSize(12).fontColor(Palette.danger)
+      }
+      if (!this.configFailed) {
+        this.summary()
+      }
+      if (!this.wide) {
+        Scroll() {
+          Row({ space: 5 }) {
+            ForEach(FILTERS, (item: ServiceFilter) => { this.filterButton(item, false) },
+              (item: ServiceFilter) => item.id)
+          }
+        }
+        .width('100%').height(36).scrollable(ScrollDirection.Horizontal).scrollBar(BarState.Off)
+        .align(Alignment.Start)
+      }
+      this.serviceTable()
+    }
+    .layoutWeight(1).height('100%').padding(this.wide ? 22 : 14).backgroundColor(Palette.canvas)
+  }
+
+  @Builder
+  actionButton(label: string, primary: boolean) {
+    Button(label, { type: ButtonType.Normal })
+      .id('service-action-' + label).height(36).borderRadius(8).layoutWeight(1)
+      .fontSize(13).fontWeight(FontWeight.Medium).fontColor(primary ? Palette.onAccent : Palette.danger)
+      .backgroundColor(primary ? Palette.accent : Palette.dangerSoft)
+      .enabled(this.pendingService.length === 0).onClick(() => { this.runAction(label); })
+  }
+
+  @Builder
+  detailTab(id: string, label: string) {
+    Button(label, { type: ButtonType.Normal })
+      .id('detail-' + id).height(32).borderRadius(6).layoutWeight(1).fontSize(13)
+      .fontWeight(this.tab === id ? FontWeight.Bold : FontWeight.Medium)
+      .fontColor(this.tab === id ? Palette.accent : Palette.muted)
+      .backgroundColor(this.tab === id ? Palette.surface : Color.Transparent)
+      .onClick(() => { this.tab = id; })
+  }
+
+  @Builder
+  overview() {
+    Scroll() {
+      Column({ space: 16 }) {
+        Row({ space: 12 }) {
+          Column({ space: 5 }) {
+            Text('进程 PID').fontSize(12).fontColor(Palette.muted)
+            Text(this.selected && this.selected.pid > 0 ? this.selected.pid.toString() : '—')
+              .fontSize(17).fontFamily('monospace').fontWeight(FontWeight.Medium).fontColor(Palette.ink)
+          }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+          Column({ space: 5 }) {
+            Text('定时计划').fontSize(12).fontColor(Palette.muted)
+            Text(this.selected?.timerText || '未设置').fontSize(13).fontColor(Palette.ink)
+          }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+        }
+        .width('100%').padding(12).borderRadius(8).backgroundColor(Palette.soft)
+        DetailField({ label: '可执行文件', value: this.selected?.bin || '缺少启动命令' })
+        if (this.selected?.args.length) {
+          DetailField({ label: '启动参数', value: JSON.stringify(this.selected.args) })
+        }
+        if (this.selected?.unit) {
+          DetailField({ label: '单元文件', value: this.selected.unit })
+        }
+        DetailField({ label: 'PID 文件', value: this.selected?.pidfile || '—' })
+      }
+      .width('100%').alignItems(HorizontalAlign.Start).padding({ left: 18, right: 18, top: 16, bottom: 18 })
+    }
+    .width('100%').layoutWeight(1).align(Alignment.TopStart).scrollBar(BarState.Auto)
+  }
+
+  @Builder
+  details() {
+    Column() {
+      if (this.selected) {
+        Column({ space: 10 }) {
+          Row({ space: 8 }) {
+            if (!this.wide) {
+              Button('返回列表', { type: ButtonType.Normal })
+                .id('back-to-services').height(32).borderRadius(6).padding({ left: 8, right: 8 })
+                .fontSize(12).fontColor(Palette.accent).backgroundColor(Palette.selected)
+                .onClick(() => { this.showDetail = false; })
+            } else {
+              Text('服务详情').fontSize(12).fontWeight(FontWeight.Medium).fontColor(Palette.muted)
+            }
+          }.width('100%')
+          Text(this.selected.name).fontSize(23).fontWeight(FontWeight.Bold).fontColor(Palette.ink)
+            .maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis })
+          Row({ space: 10 }) {
+            StatusBadge({ status: this.selected.status })
+            Text(this.selected.type === 'unit' ? 'Systemd 单元' : '可执行程序').fontSize(12).fontColor(Palette.muted)
+          }
+          if (this.selected.enabled && this.selected.bin) {
+            Row({ space: 8 }) {
+              if (this.selected.status === 'started') {
+                this.actionButton('重启', true)
+                this.actionButton('停止', false)
+              } else {
+                this.actionButton('启动', true)
+              }
+            }.width('100%')
+          }
+          if (this.selected.status === 'not-found') {
+            Text('brew formula 已卸载（unit 文件不存在）。运行 harbor cleanup 清理；' +
+              '彻底移除用 harbor cleanup --prune。')
+              .fontSize(12).fontColor(Palette.danger).width('100%')
+          }
+          if (this.actionNotice) {
+            Text(this.actionNotice).fontSize(12).fontColor(Palette.muted)
+          }
+          Row({ space: 3 }) {
+            this.detailTab('overview', '概览')
+            this.detailTab('log', '日志')
+          }
+          .width('100%').padding(3).borderRadius(8).backgroundColor(Palette.soft)
+        }
+        .width('100%').alignItems(HorizontalAlign.Start)
+        .padding({ left: 18, right: 18, top: 20, bottom: 14 })
+        Divider().color(Palette.line)
+        if (this.tab === 'overview') {
+          this.overview()
+        } else {
+          ServiceLog({ path: this.selected.log })
+        }
+      } else {
+        this.emptyState('layers', '服务详情', '选择一项服务以查看运行信息与日志')
+      }
+    }
+    .height('100%').width(this.wide ? 300 : '100%')
+    .backgroundColor(Palette.surface).border({ width: { left: this.wide ? 1 : 0 }, color: Palette.line })
+  }
+
+  build() {
+    Row() {
+      if (this.wide) {
+        this.sidebar()
+      }
+      if (this.wide || !this.showDetail) {
+        this.workspace()
+      }
+      if (this.wide || this.showDetail) {
+        this.details()
+      }
+    }
+    .width('100%').height('100%').backgroundColor(Palette.canvas)
+    .onAreaChange((_previous: Area, area: Area) => {
+      this.wide = Number(area.width) >= WIDE_WINDOW;
+    })
+  }
+}
+
+@Component
+struct ServiceMetric {
+  @Prop label: string;
+  @Prop value: number;
+  @Prop tint: ResourceColor;
+  @Prop wide: boolean;
+
+  build() {
+    Column({ space: 4 }) {
+      Text(this.value.toString()).fontSize(23).fontWeight(FontWeight.Bold).fontColor(this.tint)
+      Text(this.label).fontSize(11).fontColor(Palette.muted).maxLines(1)
+    }
+    .layoutWeight(1).alignItems(HorizontalAlign.Start)
+    .padding({ left: this.wide ? 18 : 10, right: 6, top: 12, bottom: 12 })
+  }
+}
+
+@Component
+struct StatusBadge {
+  @Prop status: string;
+
+  build() {
+    Row({ space: 5 }) {
+      Circle({ width: 7, height: 7 }).fill(statusColor(this.status))
+      Text(statusText(this.status)).fontSize(12).fontWeight(FontWeight.Medium).fontColor(statusColor(this.status))
+    }
+  }
+}
+
+@Component
+struct DetailField {
+  @Prop label: string;
+  @Prop value: string;
+
+  build() {
+    Column({ space: 5 }) {
+      Text(this.label).fontSize(12).fontColor(Palette.muted)
+      Text(this.value).fontSize(13).fontColor(Palette.ink).fontFamily('monospace')
+        .copyOption(CopyOptions.LocalDevice).width('100%').wordBreak(WordBreak.BREAK_ALL)
+    }
+    .width('100%').alignItems(HorizontalAlign.Start)
   }
 }

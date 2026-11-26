@@ -12,6 +12,7 @@ import { IpcServer } from '../ipc/IpcServer';
 import { Scheduler } from '../ipc/Scheduler';
 import fileIo from '@ohos.file.fs';
 import daemonBridge from 'libharbor_bridge.so';
+import { applyTheme, readTheme, THEME_STORAGE, ThemePreference } from '../components/ThemePreference';
 
 const DOMAIN = 0x0000;
 const TAG = 'Harbor';
@@ -54,6 +55,11 @@ export default class EntryAbility extends UIAbility {
 
   onCreate(want: Want): void {
     hilog.info(DOMAIN, TAG, 'Ability onCreate');
+    try {
+      AppStorage.setOrCreate(THEME_STORAGE, readTheme(this.context));
+    } catch (error) {
+      hilog.warn(DOMAIN, TAG, 'Could not read appearance preference');
+    }
     cleanupStalePids();  // 清理已移除服务的残留 pidfile
     this.ipc.start();  // IPC server
     this.scheduler.start();  // 定时调度器（cron/interval）
@@ -155,6 +161,12 @@ export default class EntryAbility extends UIAbility {
         return;
       }
       hilog.info(DOMAIN, TAG, 'loadContent ok');
+      try {
+        applyTheme(this.context, AppStorage.get<ThemePreference>(THEME_STORAGE) ?? ThemePreference.System);
+      } catch (error) {
+        AppStorage.setOrCreate(THEME_STORAGE, ThemePreference.System);
+        hilog.warn(DOMAIN, TAG, 'Could not apply appearance preference');
+      }
     });
 
     // 先注册托盘图标，hideAbility 才有"已在状态栏"的前提
