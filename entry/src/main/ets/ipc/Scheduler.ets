@@ -134,7 +134,12 @@ export class Scheduler {
         }
         this.watchdogFails.set(app.name, fails + 1);
         hilog.info(DOMAIN, TAG, 'watchdog: %{public}s died, restarting (try %{public}d)', app.name, fails + 1);
-        this.ipc.restartService(app.name);
+        try {
+          const result: string = this.ipc.restartService(app.name);
+          hilog.info(DOMAIN, TAG, 'watchdog restart %{public}s -> %{public}s', app.name, result);
+        } catch (e) {
+          hilog.error(DOMAIN, TAG, 'watchdog restart %{public}s failed: %{public}s', app.name, JSON.stringify(e));
+        }
         continue;
       }
       if (!app.timer) continue;

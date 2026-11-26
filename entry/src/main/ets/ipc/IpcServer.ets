@@ -103,15 +103,26 @@ function startService(app: AppEntry): string {
   let log = app.log ?? '';
   const env: Record<string, string> = app.env ?? ({} as Record<string, string>);
   if (app.type === 'unit' && app.unit) {
-    const u = parseUnit(app.unit);
+    let u: SvcResult;
+    try {
+      u = parseUnit(app.unit);
+    } catch (e) {
+      const msg: string = e instanceof Error && e.message.length > 0 ? e.message : JSON.stringify(e);
+      hilog.error(DOMAIN, TAG, 'parseUnit %{public}s failed: %{public}s', app.unit, msg);
+      return 'ERR cannot read unit: ' + msg;
+    }
     bin = u.bin; args = u.args; log = u.log;
     for (const k of Object.keys(u.env)) env[k] = u.env[k];
   }
   if (bin.length === 0) return 'ERR no ExecStart/bin';
   const argsJson: string = JSON.stringify(args) as string;
   const envJson: string = JSON.stringify(env) as string;
-  const r: number = daemonBridge.spawn(bin, argsJson, log, app.pidfile, envJson);
-  return r === 0 ? 'already running' : 'started';
+  try {
+    const r: number = daemonBridge.spawn(bin, argsJson, log, app.pidfile, envJson);
+    return r === 0 ? 'already running' : 'started';
+  } catch (e) {
+    return 'ERR spawn failed: ' + JSON.stringify(e);
+  }
 }
 
 function statusJson(): string {
@@ -183,17 +194,21 @@ export class IpcServer {
 
   // 公开：重启服务（供 IPC RESTART 命令与定时调度器共用）
   restartService(name: string): string {
-    const app = findApp(name);
-    if (!app) return 'no such service';
-    const pid: number = daemonBridge.pidFromPidfile(app.pidfile);
-    if (pid > 0) {
-      const r: number = daemonBridge.killAndWait(pid, 15, 2000);
-      if (r !== 0) {
-        const r2: number = daemonBridge.killAndWait(pid, 9, 1000);
-        if (r2 !== 0) return 'old process will not die (pid ' + pid + ')';
+    try {
+      const app = findApp(name);
+      if (!app) return 'no such service';
+      const pid: number = daemonBridge.pidFromPidfile(app.pidfile);
+      if (pid > 0) {
+        const r: number = daemonBridge.killAndWait(pid, 15, 2000);
+        if (r !== 0) {
+          const r2: number = daemonBridge.killAndWait(pid, 9, 1000);
+          if (r2 !== 0) return 'old process will not die (pid ' + pid + ')';
+        }
       }
+      return startService(app);
+    } catch (e) {
+      return 'ERR restart failed: ' + JSON.stringify(e);
     }
-    return startService(app);
   }
 
   private handle(line: string): string {
@@ -234,6 +249,7 @@ export class IpcServer {
       if (cmd === 'RESTART' && args[0]) {
         const result: string = this.restartService(args[0]);
         if (result.startsWith('no such') || result.startsWith('old process')) return 'ERR ' + result + '\n';
+        if (result.startsWith('ERR ')) return 'ERR ' + result.substring(4) + '\n';
         return 'OK {"result":"' + result + '"}\n';
       }
       if (cmd === 'RELOAD') {
